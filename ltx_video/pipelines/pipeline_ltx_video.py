@@ -38,6 +38,7 @@ from ltx_video.models.autoencoders.causal_video_autoencoder import (
 from ltx_video.schedulers.rf import TimestepShifter
 from ltx_video.utils.conditioning_method import ConditioningMethod
 from ltx_video.utils.skip_layer_strategy import SkipLayerStrategy
+from ltx_video.models.apg import MomentumBuffer, apg_normalized_guidance
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -247,6 +248,7 @@ class LTXVideoPipeline(DiffusionPipeline):
         self,
         prompt: Union[str, List[str]],
         do_classifier_free_guidance: bool = True,
+        do_adaptive_projection_guidance: bool = False,
         negative_prompt: str = "",
         num_images_per_prompt: int = 1,
         device: Optional[torch.device] = None,
@@ -354,7 +356,7 @@ class LTXVideoPipeline(DiffusionPipeline):
         prompt_attention_mask = prompt_attention_mask.view(
             bs_embed * num_images_per_prompt, -1
         )
-
+        
         # get unconditional embeddings for classifier free guidance
         if do_classifier_free_guidance and negative_prompt_embeds is None:
             uncond_tokens = [negative_prompt] * batch_size
@@ -774,11 +776,19 @@ class LTXVideoPipeline(DiffusionPipeline):
         num_inference_steps: int = 20,
         timesteps: List[int] = None,
         guidance_scale: float = 4.5,
+        ## STG
         skip_layer_strategy: Optional[SkipLayerStrategy] = None,
         skip_block_list: List[int] = None,
         stg_scale: float = 1.0,
         do_rescaling: bool = True,
         rescaling_scale: float = 0.7,
+        ## APG, APG-sample
+        apg_scale: float = 1.0,
+        apg_momentum: float = 1.0,
+        apg_eta: float = 1.0,
+        apg_r: float = 1.0,
+        apg_mode: str = 'sample', # 'noise_pred' or 'sample'.
+        ##
         num_images_per_prompt: Optional[int] = 1,
         eta: float = 0.0,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
@@ -903,11 +913,14 @@ class LTXVideoPipeline(DiffusionPipeline):
         # corresponds to doing no classifier free guidance.
         do_classifier_free_guidance = guidance_scale > 1.0
         do_spatio_temporal_guidance = stg_scale > 0.0
+        do_adaptive_projection_guidance = apg_scale > 0.0
 
         num_conds = 1
         if do_classifier_free_guidance:
             num_conds += 1
         if do_spatio_temporal_guidance:
+            num_conds += 1
+        if do_adaptive_projection_guidance:
             num_conds += 1
 
         skip_layer_mask = None
@@ -927,6 +940,7 @@ class LTXVideoPipeline(DiffusionPipeline):
         ) = self.encode_prompt(
             prompt,
             do_classifier_free_guidance,
+            do_adaptive_projection_guidance,
             negative_prompt=negative_prompt,
             num_images_per_prompt=num_images_per_prompt,
             device=device,
@@ -944,7 +958,7 @@ class LTXVideoPipeline(DiffusionPipeline):
 
         prompt_embeds_batch = prompt_embeds
         prompt_attention_mask_batch = prompt_attention_mask
-        if do_classifier_free_guidance:
+        if do_classifier_free_guidance or do_adaptive_projection_guidance:
             prompt_embeds_batch = torch.cat(
                 [negative_prompt_embeds, prompt_embeds], dim=0
             )
@@ -1022,6 +1036,7 @@ class LTXVideoPipeline(DiffusionPipeline):
             len(timesteps) - num_inference_steps * self.scheduler.order, 0
         )
 
+        momentum_buffer = MomentumBuffer(momentum=apg_momentum) if do_adaptive_projection_guidance else None
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 if conditioning_method == ConditioningMethod.FIRST_FRAME:
@@ -1124,6 +1139,11 @@ class LTXVideoPipeline(DiffusionPipeline):
                     noise_pred = noise_pred_uncond + guidance_scale * (
                         noise_pred_text - noise_pred_uncond
                     )
+                if do_adaptive_projection_guidance:
+                    if apg_mode == 'latent':
+                        noise_pred_uncond, noise_pred_text = noise_pred[:2].chunk(2)
+                        noise_pred = apg_normalized_guidance(noise_pred_text, noise_pred_uncond, apg_scale, momentum_buffer, eta=apg_eta, norm_threshold=apg_r)
+                    ## Update here
                 if do_spatio_temporal_guidance:
                     noise_pred = noise_pred + stg_scale * (
                         noise_pred_text - noise_pred_text_perturb
