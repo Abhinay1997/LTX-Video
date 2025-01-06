@@ -1143,7 +1143,7 @@ class LTXVideoPipeline(DiffusionPipeline):
                     if apg_mode == 'latent':
                         noise_pred_uncond, noise_pred_text = noise_pred[:2].chunk(2)
                         noise_pred = apg_normalized_guidance(noise_pred_text, noise_pred_uncond, apg_scale, momentum_buffer, eta=apg_eta, norm_threshold=apg_r)
-                    ## Update here
+                    
                 if do_spatio_temporal_guidance:
                     noise_pred = noise_pred + stg_scale * (
                         noise_pred_text - noise_pred_text_perturb

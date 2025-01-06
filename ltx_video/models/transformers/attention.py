@@ -23,11 +23,14 @@ from torch import nn
 from ltx_video.utils.skip_layer_strategy import SkipLayerStrategy
 
 try:
-    from torch_xla.experimental.custom_kernel import flash_attention
+    # This is a temporary fix until our changes will be merged to torch_xla.
+    from ltx_video.models.transformers.custom_kernel_spmd import flash_attention
+    from torch_xla.distributed.spmd import Mesh
 except ImportError:
     # workaround for automatic tests. Currently this function is manually patched
     # to the torch_xla lib on setup of container
-    pass
+    Mesh = None
+
 
 # code adapted from  https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/attention.py
 
@@ -205,6 +208,7 @@ class BasicTransformerBlock(nn.Module):
         timestep: Optional[torch.LongTensor] = None,
         cross_attention_kwargs: Dict[str, Any] = None,
         class_labels: Optional[torch.LongTensor] = None,
+        sharding_mesh: Optional[Mesh] = None,
         added_cond_kwargs: Optional[Dict[str, torch.Tensor]] = None,
         skip_layer_mask: Optional[torch.Tensor] = None,
         skip_layer_strategy: Optional[SkipLayerStrategy] = None,
@@ -257,6 +261,7 @@ class BasicTransformerBlock(nn.Module):
                 encoder_hidden_states if self.only_cross_attention else None
             ),
             attention_mask=attention_mask,
+            sharding_mesh=sharding_mesh,
             skip_layer_mask=skip_layer_mask,
             skip_layer_strategy=skip_layer_strategy,
             **cross_attention_kwargs,
@@ -279,6 +284,7 @@ class BasicTransformerBlock(nn.Module):
                 freqs_cis=freqs_cis,
                 encoder_hidden_states=encoder_hidden_states,
                 attention_mask=encoder_attention_mask,
+                sharding_mesh=sharding_mesh,
                 **cross_attention_kwargs,
             )
             hidden_states = attn_output + hidden_states
@@ -653,6 +659,7 @@ class Attention(nn.Module):
         freqs_cis: Optional[Tuple[torch.FloatTensor, torch.FloatTensor]] = None,
         encoder_hidden_states: Optional[torch.FloatTensor] = None,
         attention_mask: Optional[torch.FloatTensor] = None,
+        sharding_mesh: Optional[Mesh] = None,
         skip_layer_mask: Optional[torch.Tensor] = None,
         skip_layer_strategy: Optional[SkipLayerStrategy] = None,
         **cross_attention_kwargs,
@@ -702,6 +709,7 @@ class Attention(nn.Module):
             freqs_cis=freqs_cis,
             encoder_hidden_states=encoder_hidden_states,
             attention_mask=attention_mask,
+            sharding_mesh=sharding_mesh,
             skip_layer_mask=skip_layer_mask,
             skip_layer_strategy=skip_layer_strategy,
             **cross_attention_kwargs,
@@ -937,6 +945,7 @@ class AttnProcessor2_0:
         freqs_cis: Tuple[torch.FloatTensor, torch.FloatTensor],
         encoder_hidden_states: Optional[torch.FloatTensor] = None,
         attention_mask: Optional[torch.FloatTensor] = None,
+        sharding_mesh: Optional[Mesh] = None,
         temb: Optional[torch.FloatTensor] = None,
         skip_layer_mask: Optional[torch.FloatTensor] = None,
         skip_layer_strategy: Optional[SkipLayerStrategy] = None,
@@ -1033,6 +1042,11 @@ class AttnProcessor2_0:
                 key.shape[2] % 128 == 0
             ), f"ERROR: KEY SHAPE must be divisible by 128 (TPU limitation) [{key.shape[2]}]"
 
+            partition_spec = (
+                (("dcn", "data"), None, None, None)
+                if sharding_mesh is not None
+                else None
+            )
             # run the TPU kernel implemented in jax with pallas
             hidden_states_a = flash_attention(
                 q=query,
@@ -1041,6 +1055,8 @@ class AttnProcessor2_0:
                 q_segment_ids=q_segment_indexes,
                 kv_segment_ids=attention_mask,
                 sm_scale=attn.scale,
+                partition_spec=partition_spec,
+                mesh=sharding_mesh,
             )
         else:
             hidden_states_a = F.scaled_dot_product_attention(

@@ -145,6 +145,7 @@ class CausalVideoAutoencoder(AutoencoderKLWrapper):
             patch_size=config.get("patch_size", 1),
             latent_log_var=latent_log_var,
             norm_layer=config.get("norm_layer", "group_norm"),
+            base_channels=config.get("encoder_base_channels", 128),
         )
 
         decoder = Decoder(
@@ -156,6 +157,7 @@ class CausalVideoAutoencoder(AutoencoderKLWrapper):
             norm_layer=config.get("norm_layer", "group_norm"),
             causal=config.get("causal_decoder", False),
             timestep_conditioning=config.get("timestep_conditioning", False),
+            base_channels=config.get("decoder_base_channels", 128),
         )
 
         dims = config["dims"]
@@ -319,7 +321,7 @@ class Encoder(nn.Module):
         dims: Union[int, Tuple[int, int]] = 3,
         in_channels: int = 3,
         out_channels: int = 3,
-        blocks: List[Tuple[str, int | dict]] = [("res_x", 1)],
+        blocks: List[Tuple[str, Union[int, dict]]] = [("res_x", 1)],
         base_channels: int = 128,
         norm_num_groups: int = 32,
         patch_size: Union[int, Tuple[int]] = 1,
@@ -408,6 +410,30 @@ class Encoder(nn.Module):
                     kernel_size=3,
                     stride=(2, 2, 2),
                     causal=True,
+                )
+            elif block_name == "compress_all_res":
+                output_channel = block_params.get("multiplier", 2) * output_channel
+                block = SpaceToDepthDownsample(
+                    dims=dims,
+                    in_channels=input_channel,
+                    out_channels=output_channel,
+                    stride=(2, 2, 2),
+                )
+            elif block_name == "compress_space_res":
+                output_channel = block_params.get("multiplier", 2) * output_channel
+                block = SpaceToDepthDownsample(
+                    dims=dims,
+                    in_channels=input_channel,
+                    out_channels=output_channel,
+                    stride=(1, 2, 2),
+                )
+            elif block_name == "compress_time_res":
+                output_channel = block_params.get("multiplier", 2) * output_channel
+                block = SpaceToDepthDownsample(
+                    dims=dims,
+                    in_channels=input_channel,
+                    out_channels=output_channel,
+                    stride=(2, 1, 1),
                 )
             else:
                 raise ValueError(f"unknown block: {block_name}")
@@ -510,7 +536,7 @@ class Decoder(nn.Module):
         dims,
         in_channels: int = 3,
         out_channels: int = 3,
-        blocks: List[Tuple[str, int | dict]] = [("res_x", 1)],
+        blocks: List[Tuple[str, Union[int, dict]]] = [("res_x", 1)],
         base_channels: int = 128,
         layers_per_block: int = 2,
         norm_num_groups: int = 32,
@@ -874,6 +900,52 @@ class UNetMidBlock3D(nn.Module):
                 )
 
         return hidden_states
+
+
+class SpaceToDepthDownsample(nn.Module):
+    def __init__(self, dims, in_channels, out_channels, stride):
+        super().__init__()
+        self.stride = stride
+        self.group_size = in_channels * np.prod(stride) // out_channels
+        self.conv = make_conv_nd(
+            dims=dims,
+            in_channels=in_channels,
+            out_channels=out_channels // np.prod(stride),
+            kernel_size=3,
+            stride=1,
+            causal=True,
+        )
+
+    def forward(self, x, causal: bool = True):
+        if self.stride[0] == 2:
+            x = torch.cat(
+                [x, x[:, :, -1:, :, :]], dim=2
+            )  # duplicate last frames for padding
+
+        # skip connection
+        x_in = rearrange(
+            x,
+            "b c (d p1) (h p2) (w p3) -> b (c p1 p2 p3) d h w",
+            p1=self.stride[0],
+            p2=self.stride[1],
+            p3=self.stride[2],
+        )
+        x_in = rearrange(x_in, "b (c g) d h w -> b c g d h w", g=self.group_size)
+        x_in = x_in.mean(dim=2)
+
+        # conv
+        x = self.conv(x, causal=causal)
+        x = rearrange(
+            x,
+            "b c (d p1) (h p2) (w p3) -> b (c p1 p2 p3) d h w",
+            p1=self.stride[0],
+            p2=self.stride[1],
+            p3=self.stride[2],
+        )
+
+        x = x + x_in
+
+        return x
 
 
 class DepthToSpaceUpsample(nn.Module):

@@ -29,6 +29,11 @@ from ltx_video.utils.diffusers_config_mapping import (
 )
 
 
+try:
+    from torch_xla.distributed.spmd import Mesh
+except ImportError:
+    Mesh = None
+
 logger = logging.get_logger(__name__)
 
 
@@ -415,6 +420,7 @@ class Transformer3DModel(ModelMixin, ConfigMixin):
         encoder_attention_mask: Optional[torch.Tensor] = None,
         skip_layer_mask: Optional[torch.Tensor] = None,
         skip_layer_strategy: Optional[SkipLayerStrategy] = None,
+        sharding_mesh: Optional[Mesh] = None,
         return_dict: bool = True,
     ):
         """
@@ -453,6 +459,7 @@ class Transformer3DModel(ModelMixin, ConfigMixin):
                 `layer, batch_idx` indicates that the layer should be skipped for the corresponding batch index.
             skip_layer_strategy ( `SkipLayerStrategy`, *optional*, defaults to `None`):
                 Controls which layers are skipped when calculating a perturbed latent for spatiotemporal guidance.
+            sharding_mesh (xs.Mesh, *optional*, defaults to 'None')
             return_dict (`bool`, *optional*, defaults to `True`):
                 Whether or not to return a [`~models.unets.unet_2d_condition.UNet2DConditionOutput`] instead of a plain
                 tuple.
@@ -556,6 +563,7 @@ class Transformer3DModel(ModelMixin, ConfigMixin):
                     timestep,
                     cross_attention_kwargs,
                     class_labels,
+                    sharding_mesh,
                     skip_layer_mask[block_idx],
                     skip_layer_strategy,
                     **ckpt_kwargs,
@@ -570,6 +578,7 @@ class Transformer3DModel(ModelMixin, ConfigMixin):
                     timestep=timestep,
                     cross_attention_kwargs=cross_attention_kwargs,
                     class_labels=class_labels,
+                    sharding_mesh=sharding_mesh,
                     skip_layer_mask=skip_layer_mask[block_idx],
                     skip_layer_strategy=skip_layer_strategy,
                 )
